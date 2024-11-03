@@ -4,7 +4,7 @@
  * Use of this software is governed by the Business Source License included
  * in the LICENSE.TXT file in the project's root directory.
  *
- * Change Date: 2025-01-01
+ * Change Date: 2026-01-01
  *
  * On the date above, in accordance with the Business Source License, use
  * of this software will be governed by version 2.0 of the Apache License.
@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-
 #include <string>
 #include <map>
 #include <vector>
@@ -25,6 +24,11 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+
+#ifdef __FreeBSD__
+#include <sched.h>
+#include <pthread_np.h>
+#endif
 
 #include "../version.h"
 #include "../include/ZeroTierOne.h"
@@ -42,6 +46,7 @@
 #include "../node/SHA512.hpp"
 #include "../node/Bond.hpp"
 #include "../node/Peer.hpp"
+#include "../node/PacketMultiplexer.hpp"
 
 #include "../osdep/Phy.hpp"
 #include "../osdep/OSUtils.hpp"
@@ -637,6 +642,7 @@ static void _peerToJson(nlohmann::json &pj,const ZT_Peer *peer, SharedPtr<Bond> 
 		j["expired"] = (bool)(peer->paths[i].expired != 0);
 		j["preferred"] = (bool)(peer->paths[i].preferred != 0);
 		j["localSocket"] = peer->paths[i].localSocket;
+		j["localPort"] = peer->paths[i].localPort;
 		if (bond && peer->isBonded) {
 			uint64_t now = OSUtils::now();
 			j["ifname"] = std::string(peer->paths[i].ifname);
@@ -758,7 +764,7 @@ struct TcpConnection
 	Mutex writeq_m;
 };
 
-struct OneServiceIncomingPacket
+struct PacketRecord
 {
 	uint64_t now;
 	int64_t sock;
@@ -785,16 +791,25 @@ public:
 	SoftwareUpdater *_updater;
 	bool _updateAutoApply;
 
-    httplib::Server _controlPlane;
+	httplib::Server _controlPlane;
 	httplib::Server _controlPlaneV6;
-    std::thread _serverThread;
+	std::thread _serverThread;
 	std::thread _serverThreadV6;
 	bool _serverThreadRunning;
 	bool _serverThreadRunningV6;
 
-    bool _allowTcpFallbackRelay;
+	BlockingQueue<PacketRecord *> _rxPacketQueue;
+	std::vector<PacketRecord *> _rxPacketVector;
+	std::vector<std::thread> _rxPacketThreads;
+	Mutex _rxPacketVector_m,_rxPacketThreads_m;
+	bool _multicoreEnabled;
+	bool _cpuPinningEnabled;
+	unsigned int _concurrency;
+
+	bool _allowTcpFallbackRelay;
 	bool _forceTcpRelay;
 	bool _allowSecondaryPort;
+	bool _enableWebServer;
 
 	unsigned int _primaryPort;
 	unsigned int _secondaryPort;
@@ -842,8 +857,6 @@ public:
 	// Deadline for the next background task service function
 	volatile int64_t _nextBackgroundTaskDeadline;
 
-
-
 	std::map<uint64_t,NetworkState> _nets;
 	Mutex _nets_m;
 
@@ -890,9 +903,9 @@ public:
 		,_node((Node *)0)
 		,_updater((SoftwareUpdater *)0)
 		,_updateAutoApply(false)
-        ,_controlPlane()
+		,_controlPlane()
 		,_controlPlaneV6()
-        ,_serverThread()
+		,_serverThread()
 		,_serverThreadV6()
 		,_serverThreadRunning(false)
 		,_serverThreadRunningV6(false)
@@ -926,9 +939,9 @@ public:
 		_ports[1] = 0;
 		_ports[2] = 0;
 
-        prometheus::simpleapi::saver.set_registry(prometheus::simpleapi::registry_ptr);
-        prometheus::simpleapi::saver.set_delay(std::chrono::seconds(5));
-        prometheus::simpleapi::saver.set_out_file(_homePath + ZT_PATH_SEPARATOR + "metrics.prom");
+		prometheus::simpleapi::saver.set_registry(prometheus::simpleapi::registry_ptr);
+		prometheus::simpleapi::saver.set_delay(std::chrono::seconds(5));
+		prometheus::simpleapi::saver.set_out_file(_homePath + ZT_PATH_SEPARATOR + "metrics.prom");
 
 #if ZT_VAULT_SUPPORT
 		curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -940,26 +953,49 @@ public:
 #ifdef __WINDOWS__
 		WinFWHelper::removeICMPRules();
 #endif
+
+		_rxPacketQueue.stop();
+		_rxPacketThreads_m.lock();
+		for(auto t=_rxPacketThreads.begin();t!=_rxPacketThreads.end();++t) {
+			t->join();
+		}
+		_rxPacketThreads_m.unlock();
 		_binder.closeAll(_phy);
 
 #if ZT_VAULT_SUPPORT
 		curl_global_cleanup();
 #endif
 
-        _controlPlane.stop();
+		_controlPlane.stop();
 		if (_serverThreadRunning) {
-	        _serverThread.join();
+			_serverThread.join();
 		}
 		_controlPlaneV6.stop();
 		if (_serverThreadRunningV6) {
 			_serverThreadV6.join();
 		}
+		_rxPacketVector_m.lock();
+		while (!_rxPacketVector.empty()) {
+			delete _rxPacketVector.back();
+			_rxPacketVector.pop_back();
+		}
+		_rxPacketVector_m.unlock();
+
 
 #ifdef ZT_USE_MINIUPNPC
 		delete _portMapper;
 #endif
 		delete _controller;
 		delete _rc;
+	}
+
+	void setUpMultithreading()
+	{
+#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__WINDOWS__)
+		return;
+#endif
+		_node->initMultithreading(_concurrency, _cpuPinningEnabled);
+		bool pinning = _cpuPinningEnabled;
 	}
 
 	virtual ReasonForTermination run()
@@ -976,7 +1012,7 @@ public:
 					if (!OSUtils::writeFile(authTokenPath.c_str(),_authToken)) {
 						Mutex::Lock _l(_termReason_m);
 						_termReason = ONE_UNRECOVERABLE_ERROR;
-						_fatalErrorMessage = "authtoken.secret could not be written";
+						_fatalErrorMessage = "authtoken.secret could not be written (try running with -U to prevent dropping of privileges)";
 						return _termReason;
 					} else {
 						OSUtils::lockDownFile(authTokenPath.c_str(),false);
@@ -996,7 +1032,7 @@ public:
 					if (!OSUtils::writeFile(metricsTokenPath.c_str(),_metricsToken)) {
 						Mutex::Lock _l(_termReason_m);
 						_termReason = ONE_UNRECOVERABLE_ERROR;
-						_fatalErrorMessage = "metricstoken.secret could not be written";
+						_fatalErrorMessage = "metricstoken.secret could not be written (try running with -U to prevent dropping of privileges)";
 						return _termReason;
 					} else {
 						OSUtils::lockDownFile(metricsTokenPath.c_str(),false);
@@ -1172,25 +1208,25 @@ public:
 					}
 				}
 
-				// If secondary port is not configured to a constant value and we've been offline for a while,
-				// bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
-				// working on one port after a while.
-				if (_secondaryPort == 0) {
-					if (_node->online()) {
-						lastOnline = now;
-					}
-					if ((now - lastOnline) > ZT_PATH_HEARTBEAT_PERIOD  || restarted) {
-						_ports[1] = _getRandomPort();
-#if ZT_DEBUG==1
-						fprintf(stderr, "randomized secondary port. Now it's %d\n", _ports[1]);
-#endif
-						lastOnline = now; // don't keep spamming this branch. online() will be false for a few seconds
-					}
-				}
-
-
 				// Refresh bindings in case device's interfaces have changed, and also sync routes to update any shadow routes (e.g. shadow default)
 				if (((now - lastBindRefresh) >= (_node->bondController()->inUse() ? ZT_BINDER_REFRESH_PERIOD / 4 : ZT_BINDER_REFRESH_PERIOD))||restarted) {
+					// If secondary port is not configured to a constant value and we've been offline for a while,
+					// bind a new secondary port. This is a workaround for a "coma" issue caused by buggy NATs that stop
+					// working on one port after a while.
+					if (_secondaryPort == 0) {
+						if (_node->online()) {
+							lastOnline = now;
+						}
+						else if (now - lastOnline > (ZT_PEER_PING_PERIOD * 2) || restarted) {
+							lastOnline = now;	// don't keep changing the port before we have a chance to connect
+							_ports[1] = _getRandomPort();
+
+#if ZT_DEBUG==1
+							fprintf(stderr, "Randomized secondary port. Now it's %d\n", _ports[1]);
+#endif
+						}
+					}
+
 					unsigned int p[3];
 					unsigned int pc = 0;
 					for(int i=0;i<3;++i) {
@@ -1270,6 +1306,9 @@ public:
 				const unsigned long delay = (dl > now) ? (unsigned long)(dl - now) : 500;
 				clockShouldBe = now + (int64_t)delay;
 				_phy.poll(delay);
+
+
+
 			}
 		} catch (std::exception &e) {
 			Mutex::Lock _l(_termReason_m);
@@ -1542,7 +1581,7 @@ public:
 		// control plane endpoints
 		std::string bondShowPath = "/bond/show/([0-9a-fA-F]{10})";
 		std::string bondRotatePath = "/bond/rotate/([0-9a-fA-F]{10})";
-		std::string setBondMtuPath = "/bond/setmtu/([0-9]{3,5})/([a-zA-Z0-9_]{1,16})/([0-9a-fA-F\\.\\:]{1,39})";
+		std::string setBondMtuPath = "/bond/setmtu/([0-9]{1,6})/([a-zA-Z0-9_]{1,16})/([0-9a-fA-F\\.\\:]{1,39})";
 		std::string configPath = "/config";
 		std::string configPostPath = "/config/settings";
 		std::string healthPath = "/health";
@@ -1556,6 +1595,7 @@ public:
 		std::string metricsPath = "/metrics";
 
         std::vector<std::string> noAuthEndpoints { "/sso", "/health" };
+
 
 		auto setContent = [=] (const httplib::Request &req, httplib::Response &res, std::string content) {
 			if (req.has_param("jsonp")) {
@@ -1573,8 +1613,98 @@ public:
 			}
 		};
 
+		//
+		// static file server for app ui'
+		//
+		if (_enableWebServer) {
+			static std::string appUiPath = "/app";
+			static char appUiDir[16384];
+			sprintf(appUiDir,"%s%s",_homePath.c_str(),appUiPath.c_str());
 
-        auto authCheck = [=] (const httplib::Request &req, httplib::Response &res) {
+			auto ret = _controlPlane.set_mount_point(appUiPath, appUiDir);
+			_controlPlaneV6.set_mount_point(appUiPath, appUiDir);
+			if (!ret) {
+				fprintf(stderr, "Mounting app directory failed. Creating it. Path: %s - Dir: %s\n", appUiPath.c_str(), appUiDir);
+				if (!OSUtils::mkdir(appUiDir)) {
+					fprintf(stderr, "Could not create app directory either. Path: %s - Dir: %s\n", appUiPath.c_str(), appUiDir);
+				} else {
+					ret = _controlPlane.set_mount_point(appUiPath, appUiDir);
+					_controlPlaneV6.set_mount_point(appUiPath, appUiDir);
+					if (!ret) {
+						fprintf(stderr, "Really could not create and mount directory. Path: %s - Dir: %s\nWeb apps won't work.\n", appUiPath.c_str(), appUiDir);
+					}
+				}
+			}
+
+			if (ret) {
+				// fallback to /index.html for paths that don't exist for SPAs
+				auto indexFallbackGet = [](const httplib::Request &req, httplib::Response &res) {
+					// fprintf(stderr, "fallback \n");
+
+					auto match = req.matches[1];
+					if (match.matched) {
+
+						// fallback
+						char indexHtmlPath[16384];
+						sprintf(indexHtmlPath,"%s/%s/%s", appUiDir, match.str().c_str(), "index.html");
+						// fprintf(stderr, "fallback path %s\n", indexHtmlPath);
+
+						std::string indexHtml;
+
+						if (!OSUtils::readFile(indexHtmlPath, indexHtml)) {
+							res.status = 500;
+							return;
+						}
+
+						res.set_content(indexHtml.c_str(), "text/html");
+					} else {
+						res.status = 500;
+						return;
+					}
+				};
+
+				auto slashRedirect = [](const httplib::Request &req, httplib::Response &res) {
+					// fprintf(stderr, "redirect \n");
+
+					// add .html
+					std::string htmlFile;
+					char htmlPath[16384];
+					sprintf(htmlPath,"%s%s%s", appUiDir, (req.path).substr(appUiPath.length()).c_str(), ".html");
+					// fprintf(stderr, "path: %s\n", htmlPath);
+					if (OSUtils::readFile(htmlPath, htmlFile)) {
+						res.set_content(htmlFile.c_str(), "text/html");
+						return;
+					} else {
+						res.status = 301;
+						res.set_header("location", req.path + "/");
+					}
+				};
+
+				// auto missingAssetGet = [&, setContent](const httplib::Request &req, httplib::Response &res) {
+				// 	fprintf(stderr, "missing \n");
+				// 	res.status = 404;
+				// 	std::string html = "oops";
+				// 	res.set_content(html, "text/plain");
+				// 	res.set_header("Content-Type", "text/plain");
+				// 	return;
+				// };
+
+				// auto fix no trailing slash by adding .html or redirecting to path/
+				_controlPlane.Get(appUiPath + R"((/[\w|-]+)+$)", slashRedirect);
+				_controlPlaneV6.Get(appUiPath + R"((/[\w|-]+)+$)", slashRedirect);
+
+				// // 404 missing assets for *.ext paths
+				//   s.Get(appUiPath + R"(/\.\w+$)", missingAssetGet);
+				// sv6.Get(appUiPath + R"(/\.\w+$)", missingAssetGet);
+
+				// fallback to index.html for unknown paths/files
+				_controlPlane.Get(appUiPath + R"((/[\w|-]+)(/[\w|-]+)*/$)", indexFallbackGet);
+				_controlPlaneV6.Get(appUiPath + R"((/[\w|-]+)(/[\w|-]+)*/$)", indexFallbackGet);
+
+			}
+		}
+
+		auto authCheck = [=] (const httplib::Request &req, httplib::Response &res) {
 			if (req.path == "/metrics") {
 
 				if (req.has_header("x-zt1-auth")) {
@@ -1624,6 +1754,11 @@ public:
 						isAuth = true;
 					}
 
+					// Web Apps base path
+					if (req.path.rfind("/app", 0) == 0) { //starts with /app
+						isAuth = true;
+					}
+
 					if (!isAuth) {
 						// check auth token
 						if (req.has_header("x-zt1-auth")) {
@@ -1662,6 +1797,7 @@ public:
 
 			ZT_PeerList *pl = _node->peers();
 			if (pl) {
+				bool foundBond = false;
 				auto id = req.matches[1];
 				auto out = json::object();
 				uint64_t wantp = Utils::hexStrToU64(id.str().c_str());
@@ -1671,11 +1807,17 @@ public:
 						if (bond) {
 							_peerToJson(out,&(pl->peers[i]),bond,(_tcpFallbackTunnel != (TcpConnection *)0));
 							setContent(req, res, out.dump());
+							foundBond = true;
 						} else {
 							setContent(req, res, "");
 							res.status = 400;
 						}
+						break;
 					}
+				}
+				if (!foundBond) {
+					setContent(req, res, "");
+					res.status = 400;
 				}
 			}
 			_node->freeQueryResult((void *)pl);
@@ -1711,12 +1853,21 @@ public:
 
 		auto setMtu = [&, setContent](const httplib::Request &req, httplib::Response &res) {
 			if (!_node->bondController()->inUse()) {
-				setContent(req, res, "");
+				setContent(req, res, "Bonding layer isn't active yet");
 				res.status = 400;
 				return;
 			}
-			uint16_t mtu = atoi(req.matches[1].str().c_str());
+			uint32_t mtu = atoi(req.matches[1].str().c_str());
+			if (mtu < 68 || mtu > 65535) {
+				setContent(req, res, "Specified MTU is not reasonable");
+				res.status = 400;
+				return;
+			}
 			res.status = _node->bondController()->setAllMtuByTuple(mtu, req.matches[2].str().c_str(), req.matches[3].str().c_str()) ? 200 : 400;
+			if (res.status == 400) {
+				setContent(req, res, "Unable to find specified link");
+				return;
+			}
 			setContent(req, res, "{}");
 		};
 		_controlPlane.Post(setBondMtuPath, setMtu);
@@ -2041,6 +2192,7 @@ public:
             settings["primaryPort"] = OSUtils::jsonInt(settings["primaryPort"],(uint64_t)_primaryPort) & 0xffff;
             settings["secondaryPort"] = OSUtils::jsonInt(settings["secondaryPort"],(uint64_t)_ports[1]) & 0xffff;
             settings["tertiaryPort"] = OSUtils::jsonInt(settings["tertiaryPort"],(uint64_t)_tertiaryPort) & 0xffff;
+            settings["homeDir"] = _homePath;
             // Enumerate all local address/port pairs that this node is listening on
             std::vector<InetAddress> boundAddrs(_binder.allBoundLocalInterfaceAddresses());
             auto boundAddrArray = json::array();
@@ -2395,7 +2547,7 @@ public:
 					}
 					_node->bondController()->addCustomLink(customPolicyStr, new Link(linkNameStr,ipvPref,mtu,capacity,enabled,linkMode,failoverToStr));
 				}
-				std::string linkSelectMethodStr(OSUtils::jsonString(customPolicy["activeReselect"],"optimize"));
+				std::string linkSelectMethodStr(OSUtils::jsonString(customPolicy["activeReselect"],"always"));
 				if (linkSelectMethodStr == "always") {
 					newTemplateBond->setLinkSelectMethod(ZT_BOND_RESELECTION_POLICY_ALWAYS);
 				}
@@ -2427,8 +2579,14 @@ public:
 		}
 
 		// bondingPolicy cannot be used with allowTcpFallbackRelay
-		_allowTcpFallbackRelay = OSUtils::jsonBool(settings["allowTcpFallbackRelay"],true);
-		_forceTcpRelay = OSUtils::jsonBool(settings["forceTcpRelay"],false);
+		bool _forceTcpRelayTmp = (OSUtils::jsonBool(settings["forceTcpRelay"],false));
+		bool _bondInUse = _node->bondController()->inUse();
+		if (_forceTcpRelayTmp && _bondInUse) {
+			fprintf(stderr, "Warning: forceTcpRelay cannot be used with multipath. Disabling forceTcpRelay\n");
+		}
+		_allowTcpFallbackRelay = (OSUtils::jsonBool(settings["allowTcpFallbackRelay"],true) && !_node->bondController()->inUse());
+		_forceTcpRelay = (_forceTcpRelayTmp && !_node->bondController()->inUse());
+		_enableWebServer = (OSUtils::jsonBool(settings["enableWebServer"],false));
 
 #ifdef ZT_TCP_FALLBACK_RELAY
 		_fallbackRelayAddress = InetAddress(OSUtils::jsonString(settings["tcpFallbackRelay"], ZT_TCP_FALLBACK_RELAY).c_str());
@@ -2442,6 +2600,29 @@ public:
 		}
 		_portMappingEnabled = OSUtils::jsonBool(settings["portMappingEnabled"],true);
 		_node->setLowBandwidthMode(OSUtils::jsonBool(settings["lowBandwidthMode"],false));
+#if defined(__LINUX__) || defined(__FreeBSD__)
+		_multicoreEnabled = OSUtils::jsonBool(settings["multicoreEnabled"],false);
+		_concurrency = OSUtils::jsonInt(settings["concurrency"],1);
+		_cpuPinningEnabled = OSUtils::jsonBool(settings["cpuPinningEnabled"],false);
+		if (_multicoreEnabled) {
+			unsigned int maxConcurrency = std::thread::hardware_concurrency();
+			if (_concurrency <= 1 || _concurrency >= maxConcurrency) {
+				unsigned int conservativeDefault = (std::thread::hardware_concurrency() >= 4 ? 2 : 1);
+				fprintf(stderr, "Concurrency level provided (%d) is invalid, assigning conservative default value of (%d)\n", _concurrency, conservativeDefault);
+				_concurrency =  conservativeDefault;
+			}
+			setUpMultithreading();
+		}
+		else {
+			// Force values in case the user accidentally defined them with multicore disabled
+			_concurrency = 1;
+			_cpuPinningEnabled = false;
+		}
+#else
+		_multicoreEnabled = false;
+		_concurrency = 1;
+		_cpuPinningEnabled = false;
+#endif
 
 #ifndef ZT_SDK
 		const std::string up(OSUtils::jsonString(settings["softwareUpdate"],ZT_SOFTWARE_UPDATE_DEFAULT));
@@ -2756,16 +2937,19 @@ public:
 	// Handlers for Node and Phy<> callbacks
 	// =========================================================================
 
-	inline void phyOnDatagram(PhySocket *sock,void **uptr,const struct sockaddr *localAddr,const struct sockaddr *from,void *data,unsigned long len)
+
+
+
+	inline void phyOnDatagram(PhySocket* sock, void** uptr, const struct sockaddr* localAddr, const struct sockaddr* from, void* data, unsigned long len)
 	{
 		if (_forceTcpRelay) {
 			return;
 		}
-        Metrics::udp_recv += len;
+		Metrics::udp_recv += len;
 		const uint64_t now = OSUtils::now();
-		if ((len >= 16)&&(reinterpret_cast<const InetAddress *>(from)->ipScope() == InetAddress::IP_SCOPE_GLOBAL)) {
+		if ((len >= 16) && (reinterpret_cast<const InetAddress*>(from)->ipScope() == InetAddress::IP_SCOPE_GLOBAL)) {
 			_lastDirectReceiveFromGlobal = now;
-        }
+		}
 		const ZT_ResultCode rc = _node->processWirePacket(nullptr,now,reinterpret_cast<int64_t>(sock),reinterpret_cast<const struct sockaddr_storage *>(from),data,len,&_nextBackgroundTaskDeadline);
 		if (ZT_ResultCode_isFatal(rc)) {
 			char tmp[256];
@@ -2776,6 +2960,7 @@ public:
 			this->terminate();
 		}
 	}
+
 
 	inline void phyOnTcpConnect(PhySocket *sock,void **uptr,bool success)
 	{
@@ -2995,6 +3180,8 @@ public:
 
 						n.setTap(EthernetTap::newInstance(
 							nullptr,
+							_concurrency,
+							_cpuPinningEnabled,
 							_homePath.c_str(),
 							MAC(nwc->mac),
 							nwc->mtu,
@@ -3509,8 +3696,9 @@ public:
 	inline void nodeVirtualNetworkFrameFunction(uint64_t nwid,void **nuptr,uint64_t sourceMac,uint64_t destMac,unsigned int etherType,unsigned int vlanId,const void *data,unsigned int len)
 	{
 		NetworkState *n = reinterpret_cast<NetworkState *>(*nuptr);
-		if ((!n)||(!n->tap()))
+		if ((!n)||(!n->tap())) {
 			return;
+		}
 		n->tap()->put(MAC(sourceMac),MAC(destMac),etherType,data,len);
 	}
 
