@@ -1,23 +1,19 @@
-/*
- * Copyright (c)2013-2021 ZeroTier, Inc.
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * Use of this software is governed by the Business Source License included
- * in the LICENSE.TXT file in the project's root directory.
- *
- * Change Date: 2026-01-01
- *
- * On the date above, in accordance with the Business Source License, use
- * of this software will be governed by version 2.0 of the Apache License.
+ * (c) ZeroTier, Inc.
+ * https://www.zerotier.com/
  */
-/****/
 
 #include "Bond.hpp"
 
+#include "Constants.hpp"
+#include "Node.hpp"
 #include "Switch.hpp"
 
 #include <cinttypes>   // for PRId64, etc. macros
 #include <cmath>
-#include <cstdio>
 #include <string>
 
 // FIXME: remove this suppression and actually fix warnings
@@ -373,7 +369,7 @@ SharedPtr<Path> Bond::getAppropriatePath(int64_t now, int32_t flowId)
 	 */
 	if (_policy == ZT_BOND_POLICY_ACTIVE_BACKUP) {
 		if (_abPathIdx != ZT_MAX_PEER_NETWORK_PATHS && _paths[_abPathIdx].p) {
-			//fprintf(stderr, "trying to send via (_abPathIdx=%d) %s\n", _abPathIdx, pathToStr(_paths[_abPathIdx].p).c_str());
+			// fprintf(stderr, "trying to send via (_abPathIdx=%d) %s\n", _abPathIdx, pathToStr(_paths[_abPathIdx].p).c_str());
 			return _paths[_abPathIdx].p;
 		}
 	}
@@ -854,7 +850,7 @@ void Bond::sendPATH_NEGOTIATION_REQUEST(void* tPtr, int pathIdx)
 	outp.append<int16_t>(_localUtility);
 	if (_paths[pathIdx].p->address()) {
 		Metrics::pkt_path_negotiation_request_out++;
-		outp.armor(_peer->key(), false, _peer->aesKeysIfSupported());
+		outp.armor(_peer->key(), true, false, _peer->aesKeysIfSupported(), _peer->identity());
 		RR->node->putPacket(tPtr, _paths[pathIdx].p->localSocket(), _paths[pathIdx].p->address(), outp.data(), outp.size());
 		_overheadBytes += outp.size();
 	}
@@ -895,11 +891,11 @@ void Bond::sendQOS_MEASUREMENT(void* tPtr, int pathIdx, int64_t localSocket, con
 		// debug("sending QOS via link %s (len=%d)", pathToStr(_paths[pathIdx].p).c_str(), len);
 		outp.append(qosData, len);
 		if (atAddress) {
-			outp.armor(_peer->key(), false, _peer->aesKeysIfSupported());
+			outp.armor(_peer->key(), true, false, _peer->aesKeysIfSupported(), _peer->identity());
 			RR->node->putPacket(tPtr, localSocket, atAddress, outp.data(), outp.size());
 		}
 		else {
-			RR->sw->send(tPtr, outp, false);
+			RR->sw->send(tPtr, outp, false, 0, ZT_QOS_NO_FLOW);
 		}
 		Metrics::pkt_qos_out++;
 		_paths[pathIdx].packetsReceivedSinceLastQoS = 0;
@@ -933,7 +929,7 @@ void Bond::processBackgroundBondTasks(void* tPtr, int64_t now)
 				if ((_monitorInterval > 0) && (((now - _paths[i].p->_lastIn) >= (_paths[i].alive ? _monitorInterval : _failoverInterval)))) {
 					if ((_peer->remoteVersionProtocol() >= 5) && (! ((_peer->remoteVersionMajor() == 1) && (_peer->remoteVersionMinor() == 1) && (_peer->remoteVersionRevision() == 0)))) {
 						Packet outp(_peer->address(), RR->identity.address(), Packet::VERB_ECHO);	// ECHO (this is our bond's heartbeat)
-						outp.armor(_peer->key(), true, _peer->aesKeysIfSupported());
+						outp.armor(_peer->key(), true, false, _peer->aesKeysIfSupported(), _peer->identity());
 						RR->node->expectReplyTo(outp.packetId());
 						RR->node->putPacket(tPtr, _paths[i].p->localSocket(), _paths[i].p->address(), outp.data(), outp.size());
 						_paths[i].p->_lastOut = now;
@@ -1584,7 +1580,7 @@ void Bond::processActiveBackupTasks(void* tPtr, int64_t now)
 						}
 					}
 				}
-				if (!foundPreferredPath && foundPathOnPrimaryLink && (nonPreferredPathIdx != ZT_MAX_PEER_NETWORK_PATHS)) {
+				if (! foundPreferredPath && foundPathOnPrimaryLink && (nonPreferredPathIdx != ZT_MAX_PEER_NETWORK_PATHS)) {
 					log("found non-preferred primary link (_abPathIdx=%d)", _abPathIdx);
 					_abPathIdx = nonPreferredPathIdx;
 				}
@@ -1750,19 +1746,11 @@ void Bond::processActiveBackupTasks(void* tPtr, int64_t now)
 			}
 		}
 	}
-	/*
 	// Sort queue based on performance
-	if (! _abFailoverQueue.empty()) {
-		for (int i = 0; i < _abFailoverQueue.size(); i++) {
-			int value_to_insert = _abFailoverQueue[i];
-			int hole_position = i;
-			while (hole_position > 0 && (_abFailoverQueue[hole_position - 1] > value_to_insert)) {
-				_abFailoverQueue[hole_position] = _abFailoverQueue[hole_position - 1];
-				hole_position = hole_position - 1;
-			}
-			_abFailoverQueue[hole_position] = value_to_insert;
-		}
-	}*/
+	std::sort(_abFailoverQueue.begin(), _abFailoverQueue.end(), [this](const int a, const int b) {
+		// Sort by failover score in descending order (highest score first)
+		return _paths[a].failoverScore > _paths[b].failoverScore;
+	});
 
 	/**
 	 * Short-circuit if we have no queued paths

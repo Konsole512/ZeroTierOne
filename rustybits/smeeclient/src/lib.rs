@@ -1,13 +1,9 @@
-/*
- * Copyright (c)2023 ZeroTier, Inc.
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * Use of this software is governed by the Business Source License included
- * in the LICENSE.TXT file in the project's root directory.
- *
- * Change Date: 2026-01-01
- *
- * On the date above, in accordance with the Business Source License, use
- * of this software will be governed by version 2.0 of the Apache License.
+ * (c) ZeroTier, Inc.
+ * https://www.zerotier.com/
  */
 
 pub mod ext;
@@ -16,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
 use temporal_client::{Client, ClientOptionsBuilder, RetryClient, WorkflowClientTrait, WorkflowOptions};
-use temporal_sdk_core_protos::{coresdk::AsJsonPayloadExt, temporal::api::enums::v1::WorkflowIdReusePolicy};
+use temporal_sdk_core_protos::{
+    coresdk::AsJsonPayloadExt,
+    temporal::api::enums::v1::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -72,7 +71,11 @@ impl SmeeClient {
         println!("notifying network joined");
         let options = WorkflowOptions {
             id_reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
+            id_conflict_policy: WorkflowIdConflictPolicy::Fail,
             execution_timeout: None,
+            completion_callbacks: Default::default(),
+            links: Default::default(),
+            priority: None,
             run_timeout: None,
             task_timeout: None,
             cron_schedule: None,

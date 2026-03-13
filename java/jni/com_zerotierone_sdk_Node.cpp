@@ -53,7 +53,8 @@ namespace {
             jobject eventListenerLocalIn,
             jobject frameListenerLocalIn,
             jobject configListenerLocalIn,
-            jobject pathCheckerLocalIn)
+            jobject pathCheckerLocalIn,
+            ZT_Node_Config *nc)
             : id(id)
             , jvm(jvm)
             , node()
@@ -64,6 +65,7 @@ namespace {
             , frameListener()
             , configListener()
             , pathChecker()
+            , nodeConfig(nc)
             , inited() {
 
             JNIEnv *env;
@@ -90,6 +92,9 @@ namespace {
             env->DeleteGlobalRef(frameListener);
             env->DeleteGlobalRef(configListener);
             env->DeleteGlobalRef(pathChecker);
+
+            delete nodeConfig;
+            nodeConfig = NULL;
         }
 
         int64_t id;
@@ -105,6 +110,7 @@ namespace {
         jobject frameListener;
         jobject configListener;
         jobject pathChecker;
+        ZT_Node_Config *nodeConfig;
 
         bool inited;
 
@@ -865,6 +871,10 @@ JNIEXPORT jobject JNICALL Java_com_zerotier_sdk_Node_node_1init(
     callbacks.pathCheckFunction = &PathCheckFunction;
     callbacks.pathLookupFunction = &PathLookupFunction;
 
+    ZT_Node_Config *nodeConfig = new ZT_Node_Config();
+    nodeConfig->enableEncryptedHello = 0;
+    nodeConfig->lowBandwidthMode = 0;
+
     //
     // a bit of a confusing dance here where ref and node both know about each other
     //
@@ -877,11 +887,13 @@ JNIEXPORT jobject JNICALL Java_com_zerotier_sdk_Node_node_1init(
             eventListener,
             frameListener,
             configListener,
-            pathChecker);
+            pathChecker,
+            nodeConfig);
 
     ZT_Node *node;
     ZT_ResultCode rc = ZT_Node_new(
         &node,
+        nodeConfig,
         ref,
         NULL,
         &callbacks,

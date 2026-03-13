@@ -1,9 +1,9 @@
 Name:           zerotier-one
-Version:        1.14.2
+Version:        1.16.1
 Release:        1%{?dist}
 Summary:        ZeroTier network virtualization service
 
-License:        ZeroTier BUSL 1.1
+License:        MPL 2.0
 URL:            https://www.zerotier.com
 
 # Fedora
@@ -102,12 +102,12 @@ ln -s %{getenv:PWD} %{name}-%{version}
 mkdir -p SOURCES
 tar --exclude=%{name}-%{version}/.git --exclude=%{name}-%{version}/%{name}-%{version} -czf SOURCES/%{name}-%{version}.tar.gz %{name}-%{version}/*
 rm -f %{name}-%{version}
-# cp -a %{getenv:PWD}/* .
+cp -a %{getenv:PWD}/* .
 %endif
 
 %build
 %if "%{?dist}" != ".el6"
-make ZT_USE_MINIUPNPC=1 %{?_smp_mflags} one
+make ZT_USE_MINIUPNPC=1 %{?_smp_mflags} ZT_OFFICIAL=1 ZT_NONFREE=1 one
 %endif
 
 %pre
@@ -155,6 +155,9 @@ chmod 0755 $RPM_BUILD_ROOT/etc/init.d/zerotier-one
 %endif
 
 %changelog
+* Fri Dec 12 2025 Adam Ierymenko <adam.ierymenko@zerotier.com> - 1.16.1
+- see https://github.com/zerotier/ZeroTierOne for release notes
+
 * Wed Oct 23 2024 Adam Ierymenko <adam.ierymenko@zerotier.com> - 1.14.2
 - see https://github.com/zerotier/ZeroTierOne for release notes
 

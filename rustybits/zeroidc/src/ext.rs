@@ -1,13 +1,9 @@
-/*
- * Copyright (c)2021 ZeroTier, Inc.
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * Use of this software is governed by the Business Source License included
- * in the LICENSE.TXT file in the project's root directory.
- *
- * Change Date: 2026-01-01
- *
- * On the date above, in accordance with the Business Source License, use
- * of this software will be governed by version 2.0 of the Apache License.
+ * (c) ZeroTier, Inc.
+ * https://www.zerotier.com/
  */
 
 use std::ffi::{CStr, CString};
@@ -24,7 +20,7 @@ use crate::ZeroIDC;
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_new(
+pub unsafe extern "C" fn zeroidc_new(
     issuer: *const c_char,
     client_id: *const c_char,
     auth_endpoint: *const c_char,
@@ -78,7 +74,7 @@ pub extern "C" fn zeroidc_new(
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_delete(ptr: *mut ZeroIDC) {
+pub unsafe extern "C" fn zeroidc_delete(ptr: *mut ZeroIDC) {
     if ptr.is_null() {
         return;
     }
@@ -101,7 +97,7 @@ pub extern "C" fn zeroidc_delete(ptr: *mut ZeroIDC) {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_start(ptr: *mut ZeroIDC) {
+pub unsafe extern "C" fn zeroidc_start(ptr: *mut ZeroIDC) {
     let idc = unsafe {
         assert!(!ptr.is_null());
         &mut *ptr
@@ -117,7 +113,7 @@ pub extern "C" fn zeroidc_start(ptr: *mut ZeroIDC) {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_stop(ptr: *mut ZeroIDC) {
+pub unsafe extern "C" fn zeroidc_stop(ptr: *mut ZeroIDC) {
     let idc = unsafe {
         assert!(!ptr.is_null());
         &mut *ptr
@@ -133,7 +129,7 @@ pub extern "C" fn zeroidc_stop(ptr: *mut ZeroIDC) {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_is_running(ptr: *mut ZeroIDC) -> bool {
+pub unsafe extern "C" fn zeroidc_is_running(ptr: *mut ZeroIDC) -> bool {
     let idc = unsafe {
         assert!(!ptr.is_null());
         &mut *ptr
@@ -143,7 +139,7 @@ pub extern "C" fn zeroidc_is_running(ptr: *mut ZeroIDC) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn zeroidc_get_exp_time(ptr: *mut ZeroIDC) -> u64 {
+pub unsafe extern "C" fn zeroidc_get_exp_time(ptr: *mut ZeroIDC) -> u64 {
     let id = unsafe {
         assert!(!ptr.is_null());
         &mut *ptr
@@ -160,7 +156,11 @@ pub extern "C" fn zeroidc_get_exp_time(ptr: *mut ZeroIDC) -> u64 {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_set_nonce_and_csrf(ptr: *mut ZeroIDC, csrf_token: *const c_char, nonce: *const c_char) {
+pub unsafe extern "C" fn zeroidc_set_nonce_and_csrf(
+    ptr: *mut ZeroIDC,
+    csrf_token: *const c_char,
+    nonce: *const c_char,
+) {
     let idc = unsafe {
         assert!(!ptr.is_null());
         &mut *ptr
@@ -190,7 +190,7 @@ pub extern "C" fn zeroidc_set_nonce_and_csrf(ptr: *mut ZeroIDC, csrf_token: *con
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn free_cstr(s: *mut c_char) {
+pub unsafe extern "C" fn free_cstr(s: *mut c_char) {
     if s.is_null() {
         println!("passed a null object");
         return;
@@ -209,7 +209,7 @@ pub extern "C" fn free_cstr(s: *mut c_char) {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_get_auth_url(ptr: *mut ZeroIDC) -> *mut c_char {
+pub unsafe extern "C" fn zeroidc_get_auth_url(ptr: *mut ZeroIDC) -> *mut c_char {
     if ptr.is_null() {
         println!("passed a null object");
         return std::ptr::null_mut();
@@ -228,7 +228,7 @@ pub extern "C" fn zeroidc_get_auth_url(ptr: *mut ZeroIDC) -> *mut c_char {
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_token_exchange(idc: *mut ZeroIDC, code: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn zeroidc_token_exchange(idc: *mut ZeroIDC, code: *const c_char) -> *mut c_char {
     if idc.is_null() {
         println!("idc is null");
         return std::ptr::null_mut();
@@ -265,7 +265,7 @@ pub extern "C" fn zeroidc_token_exchange(idc: *mut ZeroIDC, code: *const c_char)
 }
 
 #[no_mangle]
-pub extern "C" fn zeroidc_get_url_param_value(param: *const c_char, path: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn zeroidc_get_url_param_value(param: *const c_char, path: *const c_char) -> *mut c_char {
     if param.is_null() {
         println!("param is null");
         return std::ptr::null_mut();
@@ -292,7 +292,7 @@ pub extern "C" fn zeroidc_get_url_param_value(param: *const c_char, path: *const
 }
 
 #[no_mangle]
-pub extern "C" fn zeroidc_network_id_from_state(state: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn zeroidc_network_id_from_state(state: *const c_char) -> *mut c_char {
     if state.is_null() {
         println!("state is null");
         return std::ptr::null_mut();
@@ -318,7 +318,7 @@ pub extern "C" fn zeroidc_network_id_from_state(state: *const c_char) -> *mut c_
     target_os = "macos",
 ))]
 #[no_mangle]
-pub extern "C" fn zeroidc_kick_refresh_thread(idc: *mut ZeroIDC) {
+pub unsafe extern "C" fn zeroidc_kick_refresh_thread(idc: *mut ZeroIDC) {
     if idc.is_null() {
         println!("idc is null");
         return;
